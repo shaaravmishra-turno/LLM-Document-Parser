@@ -1,0 +1,14 @@
+streamlit
+python-dotenv
+google-generativeai
+pdf2image
+Pillow
+pandas
+openpyxl
+requests
+psycopg2-binary
+
+
+
+
+
