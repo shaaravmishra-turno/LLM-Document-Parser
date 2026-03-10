@@ -1,0 +1,28 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Excel files
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+*.csv
+
+# Environment / secrets
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+*.log
+*.tmp

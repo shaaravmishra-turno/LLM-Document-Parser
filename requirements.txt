@@ -1,6 +1,7 @@
 streamlit
 python-dotenv
 google-generativeai
+anthropic
 pdf2image
 Pillow
 pandas
