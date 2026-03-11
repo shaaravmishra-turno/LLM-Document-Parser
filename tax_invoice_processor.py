@@ -35,7 +35,7 @@ load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-opus-4-5")
+CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS        = int(os.getenv("MAX_TOKENS", "4096"))
 
 AUTH_TOKEN        = os.getenv("TURNO_AUTH_TOKEN", "")
