@@ -23,7 +23,9 @@ import json
 import logging
 import os
 import signal
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
 import pandas as pd
@@ -35,7 +37,7 @@ from PIL import Image
 load_dotenv()
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
-LOG_FILE = os.getenv("TAX_LOG_FILE", "tax_invoice_processor_421.log")
+LOG_FILE = os.getenv("TAX_LOG_FILE", "tax_invoice_processor_final.log")
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -56,6 +58,7 @@ OUTPUT_FILE       = os.getenv("TAX_OUTPUT_FILE", "TAX Invoice Filled.xlsx")
 
 BATCH_SIZE        = int(os.getenv("BATCH_SIZE", "5"))
 PROCESS_LIMIT     = int(os.getenv("PROCESS_LIMIT", "0"))  # 0 = no limit
+MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "5"))     # parallel threads
 PROMPT            = os.getenv("TAX_INVOICE_PROMPT", "Extract all fields from this vehicle tax invoice and return valid JSON.")
 
 # Columns that carry extracted data (in the same order as the Excel sheet)
@@ -83,7 +86,7 @@ DATA_COLUMNS = [
     "accessory_charges",
     "rto_charges",
     "insurance",
-    "assumed_fields"
+    "xmart_special_fee"
 ]
 
 # Graceful shutdown
@@ -217,6 +220,88 @@ def save_df(df: pd.DataFrame):
     out.to_excel(OUTPUT_FILE, index=False)
 
 
+# ─── Worker function (runs in thread pool) ────────────────────────────────────
+
+def _process_one(client, row_idx, uuid_val, file_url, pos, out_df, df_lock, counters, total_pending):
+    """Download + call Claude + fill cells for a single row. Thread-safe."""
+    if shutdown_requested:
+        return
+
+    # ── 1. Download ───────────────────────────────────────────────────────────
+    file_bytes, content_type = download_file(file_url)
+    if file_bytes is None:
+        with df_lock:
+            out_df.at[row_idx, "_status"] = "error:download_failed"
+            counters["error"] += 1
+            counters["dirty"] += 1
+            print(f"[{pos}/{total_pending}] {uuid_val}  ✗ download failed")
+        return
+
+    # Infer content_type from magic bytes when headers are unhelpful
+    if not content_type or content_type in ("application/octet-stream", "binary/octet-stream"):
+        content_type = (
+            "application/pdf"
+            if file_bytes[:4] == b"%PDF"
+            else "image/jpeg"
+        )
+
+    # ── 2. Call Claude ────────────────────────────────────────────────────────
+    t_item = time.perf_counter()
+    try:
+        raw = call_claude(client, file_bytes, content_type)
+        extracted = parse_response(raw)
+        elapsed = time.perf_counter() - t_item
+
+        # Log raw + parsed response (logging is thread-safe)
+        logger.info("UUID=%s | raw_response=%s", uuid_val, raw)
+        logger.info("UUID=%s | parsed=%s", uuid_val, json.dumps(extracted))
+
+        with df_lock:
+            if not extracted:
+                print(f"[{pos}/{total_pending}] {uuid_val}  ✗ JSON parse failed ({elapsed:.1f}s) | raw: {raw[:120]}")
+                out_df.at[row_idx, "_status"] = "error:json_parse"
+                counters["error"] += 1
+            else:
+                # ── 3. Fill only empty cells ──────────────────────────────────
+                filled_fields = []
+                for col in DATA_COLUMNS:
+                    if col not in out_df.columns:
+                        continue
+                    current = out_df.at[row_idx, col]
+                    is_empty = (
+                        current is None
+                        or (isinstance(current, float) and pd.isna(current))
+                        or str(current).strip() in ("", "nan", "NaN", "None")
+                    )
+                    if is_empty and col in extracted and str(extracted[col]).strip():
+                        out_df.at[row_idx, col] = str(extracted[col]).strip()
+                        filled_fields.append(col)
+
+                out_df.at[row_idx, "_status"] = "done"
+                counters["success"] += 1
+                print(f"[{pos}/{total_pending}] {uuid_val}  ✓ filled {len(filled_fields)} fields ({elapsed:.1f}s)")
+                logger.info("UUID=%s | filled_fields=%s", uuid_val, filled_fields)
+
+            counters["dirty"] += 1
+
+    except anthropic.RateLimitError:
+        with df_lock:
+            logger.error("UUID=%s | RateLimitError", uuid_val)
+            out_df.at[row_idx, "_status"] = "error:rate_limit"
+            counters["error"] += 1
+            counters["dirty"] += 1
+            counters["rate_limited"] = True
+        print(f"[{pos}/{total_pending}] {uuid_val}  ⚠️  rate-limited")
+    except Exception as exc:
+        elapsed = time.perf_counter() - t_item
+        with df_lock:
+            logger.error("UUID=%s | error: %s (%.1fs)", uuid_val, exc, elapsed)
+            print(f"[{pos}/{total_pending}] {uuid_val}  ✗ {exc} ({elapsed:.1f}s)")
+            out_df.at[row_idx, "_status"] = f"error:{str(exc)[:80]}"
+            counters["error"] += 1
+            counters["dirty"] += 1
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -255,111 +340,68 @@ def main():
     pending_idx = out_df[pending_mask].index.tolist()
     if PROCESS_LIMIT > 0:
         pending_idx = pending_idx[:PROCESS_LIMIT]
-        print(f"  {len(pending_idx)} items to process (capped at PROCESS_LIMIT={PROCESS_LIMIT})\n")
+        print(f"  {len(pending_idx)} items to process (capped at PROCESS_LIMIT={PROCESS_LIMIT})")
     else:
-        print(f"  {len(pending_idx)} items to process\n")
+        print(f"  {len(pending_idx)} items to process")
 
     if not pending_idx:
         print("Nothing to do — all rows already processed.")
         save_df(out_df)
         return
 
-    success = error = batch_dirty = 0
+    print(f"  Using {MAX_WORKERS} parallel workers\n")
+
+    df_lock = threading.Lock()
+    counters = {"success": 0, "error": 0, "dirty": 0, "dispatched": 0, "rate_limited": False}
     t_start = time.perf_counter()
 
-    for pos, row_idx in enumerate(pending_idx, start=1):
-        if shutdown_requested:
-            print("Shutdown requested — stopping.")
-            break
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {}
+        for row_idx in pending_idx:
+            if shutdown_requested or counters["rate_limited"]:
+                break
 
-        row      = out_df.loc[row_idx]
-        uuid_val = str(row.get("UUID", "")).strip()
-        file_url = str(row.get("file_url", "")).strip()
+            row      = out_df.loc[row_idx]
+            uuid_val = str(row.get("UUID", "")).strip()
+            file_url = str(row.get("file_url", "")).strip()
 
-        print(f"[{pos}/{len(pending_idx)}] {uuid_val}", end="  ", flush=True)
+            counters["dispatched"] += 1
+            pos = counters["dispatched"]
 
-        # ── 1. Download directly from file_url ────────────────────────────────
-        file_bytes, content_type = download_file(file_url)
-        if file_bytes is None:
-            print("✗ download failed")
-            out_df.at[row_idx, "_status"] = "error:download_failed"
-            error += 1
-            batch_dirty += 1
-            if batch_dirty >= BATCH_SIZE:
-                save_df(out_df)
-                batch_dirty = 0
-            continue
-
-        # Infer content_type from magic bytes or URL when headers are unhelpful
-        if not content_type or content_type in ("application/octet-stream", "binary/octet-stream"):
-            content_type = (
-                "application/pdf"
-                if file_bytes[:4] == b"%PDF"
-                else "image/jpeg"
+            fut = executor.submit(
+                _process_one, client, row_idx, uuid_val, file_url, pos,
+                out_df, df_lock, counters, len(pending_idx),
             )
+            futures[fut] = uuid_val
 
-        # ── 2. Call Claude ────────────────────────────────────────────────────
-        t_item = time.perf_counter()
-        try:
-            raw = call_claude(client, file_bytes, content_type)
-            extracted = parse_response(raw)
-            elapsed = time.perf_counter() - t_item
+        # Wait for all submitted tasks and do periodic batch saves
+        for fut in as_completed(futures):
+            try:
+                fut.result()  # surfaces exceptions from the worker
+            except Exception as exc:
+                print(f"  Unexpected worker error: {exc}")
 
-            # ── Log raw + parsed response ─────────────────────────────────
-            logger.info("UUID=%s | raw_response=%s", uuid_val, raw)
-            logger.info("UUID=%s | parsed=%s", uuid_val, json.dumps(extracted))
+            # Batch save under lock
+            with df_lock:
+                if counters["dirty"] >= BATCH_SIZE:
+                    save_df(out_df)
+                    counters["dirty"] = 0
 
-            if not extracted:
-                print(f"✗ JSON parse failed ({elapsed:.1f}s) | raw: {raw[:120]}")
-                out_df.at[row_idx, "_status"] = "error:json_parse"
-                error += 1
-            else:
-                # ── 3. Fill only empty cells ──────────────────────────────────
-                filled_fields = []
-                for col in DATA_COLUMNS:
-                    if col not in out_df.columns:
-                        continue
-                    current = out_df.at[row_idx, col]
-                    is_empty = (
-                        current is None
-                        or (isinstance(current, float) and pd.isna(current))
-                        or str(current).strip() in ("", "nan", "NaN", "None")
-                    )
-                    if is_empty and col in extracted and str(extracted[col]).strip():
-                        out_df.at[row_idx, col] = str(extracted[col]).strip()
-                        filled_fields.append(col)
-
-                out_df.at[row_idx, "_status"] = "done"
-                success += 1
-                print(f"✓ filled {len(filled_fields)} fields ({elapsed:.1f}s)")
-                logger.info("UUID=%s | filled_fields=%s", uuid_val, filled_fields)
-
-        except anthropic.RateLimitError as exc:
-            logger.error("UUID=%s | RateLimitError: %s", uuid_val, exc)
-            save_df(out_df)
-            raise SystemExit(
-                f"\nRate-limited after {pos} items. Re-run to resume automatically."
-            ) from exc
-        except Exception as exc:
-            elapsed = time.perf_counter() - t_item
-            logger.error("UUID=%s | error: %s (%.1fs)", uuid_val, exc, elapsed)
-            print(f"✗ {exc} ({elapsed:.1f}s)")
-            out_df.at[row_idx, "_status"] = f"error:{str(exc)[:80]}"
-            error += 1
-
-        # ── Batch save ────────────────────────────────────────────────────────
-        batch_dirty += 1
-        if batch_dirty >= BATCH_SIZE:
-            save_df(out_df)
-            batch_dirty = 0
+            if shutdown_requested or counters["rate_limited"]:
+                # Cancel pending futures that haven't started
+                for f in futures:
+                    f.cancel()
+                break
 
     # Final save
     save_df(out_df)
 
     total = time.perf_counter() - t_start
-    processed = success + error
+    processed = counters["success"] + counters["error"]
     avg = total / processed if processed else 0
-    print(f"\nDone — {success} succeeded, {error} failed  |  {total:.1f}s total  ({avg:.1f}s/item)")
+    print(f"\nDone — {counters['success']} succeeded, {counters['error']} failed  |  {total:.1f}s total  ({avg:.1f}s/item)")
+    if counters["rate_limited"]:
+        print("⚠️  Stopped early due to rate limit. Re-run to resume.")
     print(f"Output: {OUTPUT_FILE}")
 
 
