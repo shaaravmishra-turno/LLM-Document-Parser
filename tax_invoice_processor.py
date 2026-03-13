@@ -17,6 +17,7 @@ Config is loaded from .env:
     TAX_INVOICE_PROMPT
 """
 
+import argparse
 import base64
 import io
 import json
@@ -215,9 +216,16 @@ def get_processed_uuids(out_df: pd.DataFrame) -> set[str]:
 
 
 def save_df(df: pd.DataFrame):
-    """Write the DataFrame to the output Excel file (drops internal _status column)."""
+    """Write the DataFrame to the output Excel file (keeps _status for resumability)."""
+    df.to_excel(OUTPUT_FILE, index=False)
+
+
+def export_clean(df: pd.DataFrame):
+    """Write a clean copy without the internal _status column (for final delivery)."""
+    clean_path = OUTPUT_FILE.replace(".xlsx", "_clean.xlsx")
     out = df.drop(columns=["_status"], errors="ignore")
-    out.to_excel(OUTPUT_FILE, index=False)
+    out.to_excel(clean_path, index=False)
+    print(f"Clean export (no _status): {clean_path}")
 
 
 # ─── Worker function (runs in thread pool) ────────────────────────────────────
@@ -302,9 +310,26 @@ def _process_one(client, row_idx, uuid_val, file_url, pos, out_df, df_lock, coun
             counters["dirty"] += 1
 
 
+# ─── CLI arguments ─────────────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Tax invoice processor with Claude")
+    parser.add_argument(
+        "--start-row", type=int, default=None,
+        help="1-based starting row in the INPUT Excel to process from (e.g. --start-row 1994)"
+    )
+    parser.add_argument(
+        "--end-row", type=int, default=None,
+        help="1-based ending row (inclusive) in the INPUT Excel to process up to (e.g. --end-row 3000)"
+    )
+    return parser.parse_args()
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    args = parse_args()
+
     if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "your_anthropic_api_key_here":
         raise SystemExit("ERROR: Set ANTHROPIC_API_KEY in .env before running.")
 
@@ -314,6 +339,20 @@ def main():
     print(f"Reading {INPUT_FILE}…")
     df_input = pd.read_excel(INPUT_FILE, dtype=str)
     print(f"  {len(df_input)} rows  |  columns: {[c for c in df_input.columns if not c.startswith('Unnamed')]}")
+
+    # ── Apply row range filter (1-based, inclusive) ───────────────────────────
+    total_input_rows = len(df_input)
+    start_idx = (args.start_row - 1) if args.start_row else 0
+    end_idx   = args.end_row if args.end_row else total_input_rows
+
+    if start_idx < 0:
+        start_idx = 0
+    if end_idx > total_input_rows:
+        end_idx = total_input_rows
+
+    if start_idx > 0 or end_idx < total_input_rows:
+        df_input = df_input.iloc[start_idx:end_idx].reset_index(drop=True)
+        print(f"  Row range: {start_idx + 1}–{end_idx} ({len(df_input)} rows selected)")
 
     # ── Load or initialise output ─────────────────────────────────────────────
     out_df = load_output_df()
@@ -347,6 +386,7 @@ def main():
     if not pending_idx:
         print("Nothing to do — all rows already processed.")
         save_df(out_df)
+        export_clean(out_df)
         return
 
     print(f"  Using {MAX_WORKERS} parallel workers\n")
@@ -393,8 +433,10 @@ def main():
                     f.cancel()
                 break
 
-    # Final save
+    # Final save (with _status for resumability)
     save_df(out_df)
+    # Also produce a clean export without _status
+    export_clean(out_df)
 
     total = time.perf_counter() - t_start
     processed = counters["success"] + counters["error"]
