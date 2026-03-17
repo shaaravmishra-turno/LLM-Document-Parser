@@ -38,7 +38,7 @@ from PIL import Image
 load_dotenv()
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
-LOG_FILE = os.getenv("TAX_LOG_FILE", "tax_invoice_processor_final.log")
+LOG_FILE = os.getenv("TAX_LOG_FILE", "tax_invoice_processor_ocr_failure.log")
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -122,9 +122,42 @@ def download_file(url: str) -> tuple[bytes | None, str | None]:
 
 # ─── Claude helpers ───────────────────────────────────────────────────────────
 
+MAX_DIMENSION = 7900                          # Claude rejects anything ≥ 8000 px
+MAX_RAW_BYTES = int(5 * 1024 * 1024 * 3 / 4)  # ~3.75 MB raw ≈ 5 MB base64 (b64 adds ~33%)
+
+
 def _pil_to_b64(img: Image.Image) -> tuple[str, str]:
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG")
+    """Convert a PIL image to a base64 JPEG string, handling:
+    1. RGBA / P / LA modes → RGB  (JPEG has no alpha channel)
+    2. Dimensions > 7900 px       (Claude rejects ≥ 8000 px)
+    3. Encoded size > 5 MB        (Claude hard limit — raw must stay ≤ ~3.75 MB)
+    """
+    # ── 1. Strip alpha / palette ─────────────────────────────────────────────
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+
+    # ── 2. Down-scale if any dimension exceeds MAX_DIMENSION ─────────────────
+    w, h = img.size
+    if w > MAX_DIMENSION or h > MAX_DIMENSION:
+        ratio = min(MAX_DIMENSION / w, MAX_DIMENSION / h)
+        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+
+    # ── 3. Encode, reduce quality, then resize progressively until under limit
+    quality = 90
+    while True:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        if buf.tell() <= MAX_RAW_BYTES:
+            break
+
+        if quality > 30:
+            quality -= 10          # try lower quality first
+        else:
+            # Quality alone isn't enough — shrink dimensions by 20%
+            w, h = img.size
+            img = img.resize((int(w * 0.8), int(h * 0.8)), Image.LANCZOS)
+            quality = 70           # reset quality after resize
+
     return base64.standard_b64encode(buf.getvalue()).decode(), "image/jpeg"
 
 
